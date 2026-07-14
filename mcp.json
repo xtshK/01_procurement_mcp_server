@@ -1,0 +1,8 @@
+{
+  "name": "procurement-mcp-server",
+  "description": "A simple demo based on IT procurement for MCP",
+  "entry_point": ["node", "index.js"],
+  "transport": {
+    "type": "stdio"
+  }
+}

@@ -1,0 +1,15 @@
+# 相依套件
+node_modules/
+
+# 編譯輸出
+dist/
+
+# 環境變數(含密碼,絕對不要 commit!)
+.env
+.env.local
+
+# 系統檔
+.DS_Store
+
+# log
+*.log
