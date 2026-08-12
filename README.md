@@ -1,3 +1,16 @@
+# MCP Server 學習專案
+
+這個 repo 裡有兩個各自獨立的 MCP 練習題:
+
+| 目錄 | 主題 |
+|------|------|
+| 根目錄 `index.ts` | **採購流程** —— 把既有 REST 後端包成 MCP 工具(見下文) |
+| [`pomodoro/`](./pomodoro/) | **蕃茄鐘 + 實體裝置整合** —— ESP32 實體計時器走完時間後,紀錄自動進到軟體端並可被 Claude 查詢 |
+
+兩者共用 `package.json` 與 `.env`,但是完全獨立的 MCP server,可以只跑其中一個。
+
+---
+
 # Procurement MCP Server
 
 一個以 IT 採購流程為題的 MCP (Model Context Protocol) server 學習專案。
@@ -53,3 +66,15 @@ npm run dev            # 用 tsx 直接執行 index.ts
 ```
 
 修改程式後需以 `Cmd+Q` 完整結束並重新開啟 Claude Desktop。
+
+## 另一個練習題:蕃茄鐘 + 實體裝置
+
+`pomodoro/` 是獨立的第二個主題,重點在「實體硬體怎麼跟軟體紀錄整合」。
+沒有 ESP32 也能用內建的模擬器把整條路跑起來:
+
+```bash
+npm run pomodoro:api                    # 終端 A:蕃茄鐘常駐後端 (port 3101)
+npx tsx pomodoro/simulate-device.ts     # 終端 B:模擬實體裝置(含斷線、重送等異常情境)
+```
+
+詳見 [`pomodoro/README.md`](./pomodoro/README.md)。

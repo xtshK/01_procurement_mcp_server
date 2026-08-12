@@ -8,6 +8,9 @@ dist/
 .env
 .env.local
 
+# 蕃茄鐘的 SQLite 資料庫(含 WAL/SHM 副檔)——是本機資料,不進版控
+pomodoro/data/
+
 # 系統檔
 .DS_Store
 

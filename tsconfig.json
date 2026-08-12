@@ -6,7 +6,12 @@
     "esModuleInterop": true,
     "strict": true,
     "skipLibCheck": true,
-    "outDir": "./dist"
+    "outDir": "./dist",
+    // pomodoro/ 底下的檔案彼此用 "./db.ts" 這種帶副檔名的相對匯入。
+    // 這兩個選項讓 tsc 接受它,並在輸出時自動改寫成 "./db.js",
+    // 這樣 tsx(直接跑 .ts)和 node dist/(跑編譯結果)都能正確解析。
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
   },
-  "include": ["*.ts"]
+  "include": ["*.ts", "pomodoro/**/*.ts"]
 }
