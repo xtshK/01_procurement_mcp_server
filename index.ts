@@ -21,15 +21,32 @@
 //   dotenv 預設是從「目前工作目錄 cwd」找 .env,但 Claude Desktop
 //   啟動這支 server 時 cwd 不一定是專案資料夾,可能就找不到 .env。
 //   所以我們用 index.ts 自己的所在目錄去組出 .env 的絕對路徑,最保險。
+// ⚠️ 但「自己的所在目錄」會隨「怎麼執行」而改變:
+//   用 tsx 直跑 index.ts 時,__dirname 就是專案根目錄 → .env 在旁邊;
+//   npm run build 編譯後跑 dist/index.js 時,__dirname 變成 dist/ →
+//   .env 其實在上一層。只寫死一個位置,編譯版就永遠讀不到帳密、
+//   登入必定失敗。所以兩個位置都找,先找到的那個就用。
 import dotenv from 'dotenv';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const envPath = [
+  path.join(__dirname, '.env'),       // tsx 直跑:專案根目錄
+  path.join(__dirname, '..', '.env'), // 編譯後跑 dist/:上一層
+].find((candidate) => fs.existsSync(candidate));
+
 // quiet: true 很關鍵!dotenv v17 預設會印一行 "injected env..." 到 stdout,
 // 但 stdio 模式下 stdout 是 MCP 協定專用的,那行會污染協定、讓連線壞掉。
 // 所以一定要關掉它。(這正是「stdout 不能亂印」鐵則的實例)
-dotenv.config({ path: path.join(__dirname, '.env'), quiet: true });
+if (envPath) {
+  dotenv.config({ path: envPath, quiet: true });
+} else {
+  // 同理,這行警告也只能走 stderr。找不到 .env 不直接中斷,
+  // 因為使用者也可能是用系統環境變數餵設定進來的。
+  console.error('[procurement-mcp] 警告:找不到 .env,改用系統環境變數');
+}
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';

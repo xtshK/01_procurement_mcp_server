@@ -1,8 +1,8 @@
 {
   "name": "01_procurement_mcp_server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "將既有採購流程後端 (REST API) 包裝成 MCP 工具的轉接層",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch index.ts",
     "start": "tsx index.ts",
@@ -17,11 +17,9 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
     "@types/node": "^26.1.1",
     "tsx": "^4.23.0",
     "typescript": "^7.0.2"
