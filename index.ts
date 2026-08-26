@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  採購流程 MCP Server —— 第一階段 · 第三步
+ *  採購流程 MCP Server —— 第一階段 · 第四步
  * ============================================================
  *
  *  新增了兩件事(相較第一步):
@@ -15,6 +15,13 @@
  *        示範「一個 MCP 工具串接多個後端呼叫」——後端的明細 API 只認
  *        數字 id,所以先用搜尋把採購單號換成 id,再去拿明細;
  *        對 AI 來說仍然只是呼叫一個工具。
+ *
+ *  ── 第四步新增 ──────────────────────────────────────────────
+ *    (4) check_esign_status:查電子簽核進度。
+ *        這個工具的重點是「誠實處理資料的限制」——後端的
+ *        esign_requests 表沒有任何採購單欄位,所以「這張單簽到哪了」
+ *        只能用主旨文字比對,工具必須把這件事講出來,
+ *        不能讓 AI 以為那是可靠的關聯。
  *
  *  管線一樣是:
  *    AI client ──(MCP)──▶ 這支 server ──(HTTP + Bearer token)──▶ 你的後端
@@ -159,6 +166,26 @@ function formatStatus(code: number | null): string {
   return label ? `${label}(${code})` : `狀態碼 ${code}(未對應)`;
 }
 
+// ── 簽署人狀態對照表 ─────────────────────────────────────────
+// 這些是 DropboxSign 回傳的 statusCode。跟採購單狀態一樣,
+// 顯示時同時保留原始代碼,標錯也不會誤導。
+//
+// ⚠️ 'unknown' 有特別意義:後端呼叫 DropboxSign 失敗時,會退回本地
+//    資料庫存的簽署人名單,並把狀態填成 unknown。也就是說 unknown
+//    代表「問不到即時狀態」,不是「這個人還沒簽」——差別很大。
+const SIGNER_STATUS_LABELS: Record<string, string> = {
+  signed: '已簽署',
+  awaiting_signature: '等待簽署',
+  declined: '已拒簽',
+  on_hold: '暫停中',
+  unknown: '問不到即時狀態',
+};
+
+function formatSignerStatus(code: string): string {
+  const label = SIGNER_STATUS_LABELS[code];
+  return label ? `${label}(${code})` : `${code}(未對應)`;
+}
+
 // ── 共用:呼叫後端的採購單搜尋 ────────────────────────────────
 // 後端:GET /api/purchase-orders/search?q=<keyword>
 //      回傳:{ purchase_orders: [...] }
@@ -220,6 +247,84 @@ async function resolvePurchaseOrder(po: string): Promise<ResolveResult> {
       `「${trimmed}」不是完整的採購單號。找到 ${candidates.length} 筆相近的資料,` +
       `請指定其中一個單號:\n${options}`,
   };
+}
+
+// ── 共用:抓簽核請求 ─────────────────────────────────────────
+// 後端:GET /api/esign/requests?page=&pageSize=  (pageSize 上限 50)
+//      回傳:{ data, page, pageSize, total, totalPages }
+// 後端會自己清掉舊的已完成請求(只留最近 10 筆),所以總量通常很小,
+// 這裡最多翻 MAX_ESIGN_PAGES 頁就停,並回報有沒有被截斷——
+// 截斷了就要說,不能讓「沒找到」看起來像「不存在」。
+const MAX_ESIGN_PAGES = 5;
+
+async function fetchESignRequests(): Promise<{
+  requests: ESignRequest[];
+  total: number;
+  truncated: boolean;
+}> {
+  const requests: ESignRequest[] = [];
+  let page = 1;
+  let totalPages = 1;
+  let total = 0;
+
+  while (page <= totalPages && page <= MAX_ESIGN_PAGES) {
+    const res = await apiFetch(`/api/esign/requests?page=${page}&pageSize=50`);
+    if (!res.ok) {
+      throw new Error(`取得簽核請求失敗:HTTP ${res.status} ${res.statusText}`);
+    }
+    const body = (await res.json()) as ESignRequestsPage;
+    requests.push(...(body.data ?? []));
+    totalPages = body.totalPages ?? 1;
+    total = body.total ?? requests.length;
+    page += 1;
+  }
+
+  return { requests, total, truncated: totalPages > MAX_ESIGN_PAGES };
+}
+
+// ── 共用:用文字比對找「可能屬於某張採購單」的簽核請求 ──────────
+// ⚠️ 這是整個工具最需要誠實的地方。
+//   後端沒有 PO ↔ 簽核 的關聯欄位(見 ESignRequest 的註解),簽核是從
+//   「付款申請」發起的,而 esign/send 收到的 invoiceIds 也沒有存進 DB。
+//   所以這裡只能看「主旨或廠商欄位裡有沒有出現採購單號 / 它的發票號」。
+//   這是猜測,不是關聯:
+//     - 比對到 → 只能說「可能相關」
+//     - 比對不到 → 不能說「這張單沒送簽」,只能說「比對不到」
+//   工具的輸出必須把這個界線講清楚,否則 AI 會把猜測講成事實。
+function findRelatedESignRequests(
+  requests: ESignRequest[],
+  needles: string[]
+): { request: ESignRequest; matchedOn: string }[] {
+  const cleaned = needles
+    .map((n) => n?.trim().toLowerCase())
+    .filter((n): n is string => !!n && n.length >= 3); // 太短的字串會亂中
+
+  const hits: { request: ESignRequest; matchedOn: string }[] = [];
+  for (const req of requests) {
+    const haystack = `${req.subject ?? ''} ${req.vendor ?? ''}`.toLowerCase();
+    const matched = cleaned.find((n) => haystack.includes(n));
+    if (matched) hits.push({ request: req, matchedOn: matched });
+  }
+  return hits;
+}
+
+// 把一筆簽核請求排版成好讀的文字
+function formatESignRequest(req: ESignRequest, index: number): string {
+  const overall = req.isComplete ? '✅ 已完成' : '進行中';
+  const head =
+    `${index + 1}. ${req.subject ?? '(無主旨)'}\n` +
+    `   廠商:${req.vendor ?? 'N/A'}｜建立時間:${req.createdAt ?? 'N/A'}｜` +
+    `整體狀態:${overall}${req.testMode ? '｜⚠️ 測試模式' : ''}`;
+
+  const signers = [...(req.signers ?? [])].sort((a, b) => a.signOrder - b.signOrder);
+  if (signers.length === 0) {
+    return `${head}\n   (沒有簽署人資料)`;
+  }
+  const lines = signers.map(
+    (sg, i) => `     ${i + 1}. ${sg.name || '(無姓名)'} <${sg.email || '無 email'}> — ` +
+      `${formatSignerStatus(sg.statusCode)}`
+  );
+  return `${head}\n   簽署人:\n${lines.join('\n')}`;
 }
 
 // ── 建立 MCP server ─────────────────────────────────────────
@@ -513,6 +618,162 @@ server.registerTool(
   }
 );
 
+
+// ── 工具 4:check_esign_status(需登入)───────────────────────
+// 兩種用法:
+//   給 po   → 找「可能屬於這張採購單」的簽核請求(文字比對,見下)
+//   不給 po → 列出最近的簽核請求
+//
+// ⚠️ 這個工具的設計重點是「誠實」。後端沒有 PO ↔ 簽核的關聯欄位,
+//   所以給 po 的那條路只能做文字比對。工具在輸出裡一定要把
+//   「這是猜的」講清楚,否則 AI 會把「主旨沒寫單號」講成「沒送簽」,
+//   在採購流程裡那是會害人做錯決定的答案。
+server.registerTool(
+  'check_esign_status',
+  {
+    title: '查詢電子簽核進度',
+    description:
+      '查詢電子簽核(DropboxSign)的進度,包含每位簽署人簽了沒。' +
+      '不給參數時列出最近的簽核請求;給採購單號時,會找出主旨或廠商欄位' +
+      '提到該單號(或其發票號)的簽核請求。' +
+      '當使用者想知道「簽到哪了」、「誰還沒簽」、「有哪些在跑簽核」時使用。' +
+      '注意:後端沒有採購單與簽核請求的關聯欄位,依採購單查詢是文字比對,' +
+      '比對不到不代表該採購單沒有送簽。',
+    inputSchema: {
+      po: z
+        .string()
+        .optional()
+        .describe(
+          '可選:採購單號(例如 PO-0001)。給了就只找可能跟這張單相關的簽核;' +
+            '不給就列出最近的簽核請求'
+        ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(50)
+        .default(10)
+        .describe('可選:列表模式最多顯示幾筆,預設 10'),
+    },
+  },
+  async ({ po, limit }) => {
+    try {
+      const { requests, total, truncated } = await fetchESignRequests();
+
+      // 翻頁被截斷時要說,否則「沒找到」會被誤讀成「不存在」
+      const truncNote = truncated
+        ? `\n\n⚠️ 後端的簽核請求超過 ${MAX_ESIGN_PAGES} 頁,以上並非全部。`
+        : '';
+
+      // ── 模式 A:沒給採購單 → 列出最近的簽核請求 ──
+      if (!po || !po.trim()) {
+        if (requests.length === 0) {
+          return { content: [{ type: 'text' as const, text: '目前沒有任何簽核請求。' }] };
+        }
+        const shown = requests.slice(0, limit);
+        const header =
+          total > shown.length
+            ? `目前共 ${total} 筆簽核請求,顯示最近 ${shown.length} 筆:`
+            : `目前共 ${shown.length} 筆簽核請求:`;
+        const body = shown.map((r, i) => formatESignRequest(r, i)).join('\n\n');
+        return {
+          content: [{ type: 'text' as const, text: `${header}\n\n${body}${truncNote}` }],
+        };
+      }
+
+      // ── 模式 B:給了採購單 → 先確認單子存在 ──
+      const resolved = await resolvePurchaseOrder(po);
+      if (!resolved.ok) {
+        return { content: [{ type: 'text' as const, text: resolved.message }] };
+      }
+
+      // 收集比對用的關鍵字:採購單號 + 這張單底下的發票號
+      const needles: string[] = [];
+      if (resolved.header?.po_number) needles.push(resolved.header.po_number);
+      try {
+        const detailRes = await apiFetch(`/api/purchase-orders/${resolved.id}/details`);
+        if (detailRes.ok) {
+          const detail = (await detailRes.json()) as PurchaseOrderDetails;
+          for (const inv of detail.invoices ?? []) {
+            if (inv.invoice_number) needles.push(inv.invoice_number);
+          }
+        }
+      } catch {
+        // 拿不到發票號不是致命問題,退回只用單號比對
+      }
+
+      const label = resolved.header
+        ? `採購單 ${resolved.header.po_number ?? '(無單號)'} — ${resolved.header.name ?? '(無名稱)'}`
+        : `採購單(後端 id ${resolved.id})`;
+
+      // 用數字 id 查時我們沒有單號,也就沒有東西可以比對——這要講明白,
+      // 不能回一句「找不到」讓人以為是沒送簽。
+      if (needles.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `${label}\n\n` +
+                `無法比對簽核請求:後端沒有「採購單 ↔ 簽核請求」的關聯欄位,` +
+                `只能用採購單號或發票號去比對簽核主旨,` +
+                `而這次查詢是用數字 id、手上沒有單號。\n` +
+                `請改用採購單號查詢(例如 PO-0001)。`,
+            },
+          ],
+        };
+      }
+
+      const caveat =
+        `⚠️ 後端沒有「採購單 ↔ 簽核請求」的關聯欄位(esign_requests 只存廠商、` +
+        `主旨與簽署人,沒有採購單號)。以下是用「主旨或廠商欄位裡有沒有出現 ` +
+        `${needles.join('、')}」比對出來的,只能算「可能相關」。`;
+
+      const hits = findRelatedESignRequests(requests, needles);
+
+      if (hits.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `${label}\n\n${caveat}\n\n` +
+                `在目前的 ${requests.length} 筆簽核請求裡,沒有比對到。\n` +
+                `⚠️ 這不代表這張採購單沒有送簽——只代表沒有簽核請求的主旨或` +
+                `廠商欄位寫到上面那些字。要確認有沒有送簽,請到系統畫面查看。` +
+                truncNote,
+            },
+          ],
+        };
+      }
+
+      const body = hits
+        .map(
+          ({ request, matchedOn }, i) =>
+            `${formatESignRequest(request, i)}\n   (比對命中:${matchedOn})`
+        )
+        .join('\n\n');
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text:
+              `${label}\n\n${caveat}\n\n` +
+              `比對到 ${hits.length} 筆可能相關的簽核請求:\n\n${body}${truncNote}`,
+          },
+        ],
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{ type: 'text' as const, text: `❌ 查詢簽核進度時發生錯誤:${message}` }],
+      };
+    }
+  }
+);
+
 // 採購單的型別(對應後端 search route 回傳的欄位)
 interface PurchaseOrder {
   id: number | string;
@@ -560,6 +821,35 @@ interface PurchaseOrderDetails {
   //    但那是「抓取失敗」,不是「這張單沒有品項」。工具一定要照實轉達,
   //    否則 AI 會把失敗講成「查無品項」,那是會誤導人的錯誤答案。
   warning?: string;
+}
+
+// 簽核請求的型別(對應後端 GET /api/esign/requests 的回傳)
+// ⚠️ 注意這裡「沒有」任何採購單欄位:後端的 esign_requests 表只有
+//    signature_request_id / vendor / subject / test_mode / created_at
+//    / is_complete。所以採購單和簽核請求之間沒有資料層的關聯,
+//    只能靠 subject 的文字去猜——見 findRelatedESignRequests()。
+interface ESignRequest {
+  signatureRequestId: string;
+  vendor: string | null;
+  subject: string | null;
+  testMode: boolean;
+  createdAt: string | null;
+  isComplete: boolean;
+  signers: {
+    name: string;
+    email: string;
+    statusCode: string;
+    signedAt: string | null;
+    signOrder: number;
+  }[];
+}
+
+interface ESignRequestsPage {
+  data: ESignRequest[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
 }
 
 // ── 啟動 ────────────────────────────────────────────────────
