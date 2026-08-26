@@ -14,8 +14,26 @@ AI client ──(MCP / stdio)──▶ 本 server ──(HTTP + JWT)──▶ �
 
 ## 目前提供的工具
 
-- `check_backend_health` — 檢查後端是否正常運作 (呼叫 `/api/health`)
-- `search_purchase_orders` — 依關鍵字搜尋採購單,可選擇狀態碼篩選與筆數限制
+| 工具 | 說明 | 對應的後端端點 |
+|------|------|----------------|
+| `check_backend_health` | 檢查後端是否正常運作 | `GET /api/health` |
+| `search_purchase_orders` | 依關鍵字搜尋採購單,可選狀態碼篩選與筆數限制 | `GET /api/purchase-orders/search` |
+| `get_purchase_order_details` | 查單一採購單明細:品項、送達與付款資訊、發票、附件 | `GET /api/purchase-orders/search` + `GET /api/purchase-orders/:id/details` |
+| `check_esign_status` | 查電子簽核進度與每位簽署人的狀態 | `GET /api/esign/requests` |
+
+幾個實作上的注意事項:
+
+- **`get_purchase_order_details` 會串接兩個後端呼叫。** 後端明細 API 的 `:id`
+  是資料庫的數字 id,不是採購單號,所以工具先用搜尋把單號換成 id 再取明細。
+  單號沒有完全命中時會列出相近選項請使用者指定,不會自己猜一筆。
+- **後端的 `warning` 欄位會照實轉達。** 後端向 FreshService 取資料失敗時,
+  回傳的品項會是空的並附上 `warning`。工具會明確說明這是「取不到」而不是
+  「沒有」——否則 AI 會把失敗講成「這張單沒有品項」。
+- **`check_esign_status` 依採購單查詢是「文字比對」,不是資料關聯。**
+  後端的 `esign_requests` 表只存廠商、主旨與簽署人,**沒有採購單欄位**,
+  所以只能比對簽核主旨裡有沒有出現單號或發票號。工具的輸出會標明這一點:
+  比對不到不代表該採購單沒有送簽。若要真正的關聯,需要在後端的
+  `esign_requests` 加上 `po_number` 之類的欄位。
 
 ## 開發環境設定
 
@@ -26,6 +44,37 @@ npm install
 cp .env.example .env   # 然後填入 BACKEND_URL 與登入帳密
 npm run dev            # 用 tsx 直接執行 index.ts
 ```
+
+可用的 npm script:
+
+| 指令 | 用途 |
+|------|------|
+| `npm run dev` | tsx watch,改檔就重啟 |
+| `npm start` | tsx 直接跑一次 |
+| `npm run build` | 用 tsc 編譯到 `dist/` |
+| `npm run serve` | 跑編譯後的 `dist/index.js` |
+| `npm test` | 跑回歸測試(見下) |
+
+## 測試
+
+```bash
+npm test
+```
+
+測試會真的把 `index.ts` 跑起來,用 MCP 協定呼叫每個工具,後端則換成
+`test/mock-backend.mjs`——一個回傳格式照著真後端抄的假後端。所以測到的是
+整條路:zod 參數驗證 → 登入帶 token → 呼叫後端 → 後處理 → 排版輸出。
+不需要啟動真的採購後端,也不會碰到網路。
+
+```
+test/
+├── mock-backend.mjs   假後端(回傳格式對齊真後端的 route)
+├── mcp-client.mjs     用 stdio 講 MCP 的極簡測試 client
+└── tools.test.mjs     各工具的回歸測試
+```
+
+> ⚠️ 真後端改了回傳欄位時,`test/mock-backend.mjs` 也要跟著改,
+> 否則測試會綠但實際是壞的。
 
 ## 環境變數 (.env)
 
