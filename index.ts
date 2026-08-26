@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  採購流程 MCP Server —— 第一階段 · 第二步
+ *  採購流程 MCP Server —— 第一階段 · 第三步
  * ============================================================
  *
  *  新增了兩件事(相較第一步):
@@ -9,6 +9,12 @@
  *        token 過期(收到 401)時會自動重新登入再試一次。
  *    (2) 第一個「真正的」採購查詢工具 search_purchase_orders,
  *        示範怎麼用 zod 定義工具參數。
+ *
+ *  ── 第三步新增 ──────────────────────────────────────────────
+ *    (3) get_purchase_order_details:查單一採購單的明細。
+ *        示範「一個 MCP 工具串接多個後端呼叫」——後端的明細 API 只認
+ *        數字 id,所以先用搜尋把採購單號換成 id,再去拿明細;
+ *        對 AI 來說仍然只是呼叫一個工具。
  *
  *  管線一樣是:
  *    AI client ──(MCP)──▶ 這支 server ──(HTTP + Bearer token)──▶ 你的後端
@@ -153,6 +159,69 @@ function formatStatus(code: number | null): string {
   return label ? `${label}(${code})` : `狀態碼 ${code}(未對應)`;
 }
 
+// ── 共用:呼叫後端的採購單搜尋 ────────────────────────────────
+// 後端:GET /api/purchase-orders/search?q=<keyword>
+//      回傳:{ purchase_orders: [...] }
+// 兩個工具都要用到它(search_purchase_orders 直接列結果;
+// get_purchase_order_details 用它把「單號」換成後端的數字 id),
+// 所以抽成一個函式,不要各自寫一份 fetch。
+async function searchPurchaseOrders(q: string): Promise<PurchaseOrder[]> {
+  const res = await apiFetch(`/api/purchase-orders/search?q=${encodeURIComponent(q)}`);
+  if (!res.ok) {
+    throw new Error(`後端搜尋失敗:HTTP ${res.status} ${res.statusText}`);
+  }
+  const data = (await res.json()) as { purchase_orders?: PurchaseOrder[] };
+  return data.purchase_orders ?? [];
+}
+
+// ── 共用:把使用者說的「採購單」換成後端要的數字 id ───────────
+// ⚠️ 後端 GET /api/purchase-orders/:id/details 的 :id 是「後端資料庫的
+//    數字 id」,不是採購單號 po_number。但使用者和 AI 手上通常只有單號
+//    (「幫我看 PO-0001 的明細」),所以這裡先用搜尋把單號換成 id。
+//    這是 MCP 工具很典型的加值:把後端的內部識別碼藏起來,
+//    讓 AI 用人類的說法就查得到。
+type ResolveResult =
+  | { ok: true; id: number; header: PurchaseOrder | null }
+  | { ok: false; message: string };
+
+async function resolvePurchaseOrder(po: string): Promise<ResolveResult> {
+  const trimmed = po.trim();
+
+  // 純數字 → 當成後端 id 直接用。
+  // (這條路我們手上沒有表頭資料,所以輸出會少「單號 — 名稱」那一行)
+  if (/^\d+$/.test(trimmed)) {
+    return { ok: true, id: Number(trimmed), header: null };
+  }
+
+  const candidates = await searchPurchaseOrders(trimmed);
+
+  // 先找「單號完全相同」的那一筆(不分大小寫)
+  const exact = candidates.filter(
+    (c) => c.po_number?.toLowerCase() === trimmed.toLowerCase()
+  );
+  if (exact.length === 1) {
+    return { ok: true, id: Number(exact[0].id), header: exact[0] };
+  }
+
+  if (candidates.length === 0) {
+    return { ok: false, message: `找不到單號或名稱符合「${trimmed}」的採購單。` };
+  }
+
+  // 有相近的但沒有完全相同的 → 列出選項讓使用者指定。
+  // ⚠️ 這裡刻意不自己猜第一筆:猜錯會把別張單的明細講得像這張單的,
+  //    這種錯比「查不到」嚴重得多。
+  const options = candidates
+    .slice(0, 10)
+    .map((c) => `  - ${c.po_number ?? '(無單號)'} — ${c.name ?? '(無名稱)'}`)
+    .join('\n');
+  return {
+    ok: false,
+    message:
+      `「${trimmed}」不是完整的採購單號。找到 ${candidates.length} 筆相近的資料,` +
+      `請指定其中一個單號:\n${options}`,
+  };
+}
+
 // ── 建立 MCP server ─────────────────────────────────────────
 const server = new McpServer({
   name: 'procurement-mcp-server',
@@ -247,18 +316,8 @@ server.registerTool(
   // 注意:因為 limit 有 .default(20),這裡拿到的 limit 必定是數字(不會是 undefined)。
   async ({ q, status, limit }) => {
     try {
-      // ── (A) 呼叫後端:後端只認得 q ──
-      const res = await apiFetch(`/api/purchase-orders/search?q=${encodeURIComponent(q)}`);
-
-      if (!res.ok) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: `搜尋失敗:HTTP ${res.status} ${res.statusText}` }],
-        };
-      }
-
-      const data = (await res.json()) as { purchase_orders?: PurchaseOrder[] };
-      let list = data.purchase_orders ?? [];
+      // ── (A) 呼叫後端:後端只認得 q(改用共用的 searchPurchaseOrders)──
+      let list = await searchPurchaseOrders(q);
 
       // ── (B) 工具端後處理:這些是後端沒做、由 MCP 工具補上的 ──
       // (B-1) 若指定了 status,只留下該狀態的採購單(數字比對數字)
@@ -303,6 +362,157 @@ server.registerTool(
   }
 );
 
+
+// ── 工具 3:get_purchase_order_details(需登入)─────────────────
+// 這個工具示範兩件第二步沒有的事:
+//   (1) 一個 MCP 工具可以「串接多個後端呼叫」:先用搜尋把採購單號換成
+//       後端的數字 id,再去拿明細。對 AI 來說仍然只是呼叫一個工具。
+//   (2) 後端回傳的 warning 欄位要照實轉達,不能靜靜吞掉。
+//       這是「工具的誠實」問題:見 PurchaseOrderDetails.warning 的註解。
+server.registerTool(
+  'get_purchase_order_details',
+  {
+    title: '查詢採購單明細',
+    description:
+      '查詢單一採購單的完整明細,包含採購品項、送達與付款資訊、已登錄的發票、以及附件。' +
+      '直接給採購單號即可(例如 PO-0001)。' +
+      '當使用者想知道某一張採購單「買了什麼」、「發票開了沒」、「有哪些附件」時使用。' +
+      '若只是想依關鍵字找出「有哪些採購單」,請改用 search_purchase_orders。',
+    inputSchema: {
+      po: z
+        .string()
+        .min(1)
+        .describe(
+          '要查的採購單。通常給採購單號,例如 PO-0001;' +
+            '若已知後端的數字 id,也可以直接給數字'
+        ),
+    },
+  },
+  async ({ po }) => {
+    try {
+      // ── (A) 先把使用者說的單號換成後端要的數字 id ──
+      const resolved = await resolvePurchaseOrder(po);
+      if (!resolved.ok) {
+        // 找不到或不夠明確,都不是「錯誤」,而是需要使用者補資訊,
+        // 所以不設 isError,讓 AI 能自然地把訊息轉述給人。
+        return { content: [{ type: 'text' as const, text: resolved.message }] };
+      }
+
+      // ── (B) 拿明細 ──
+      const res = await apiFetch(`/api/purchase-orders/${resolved.id}/details`);
+
+      if (res.status === 404) {
+        return {
+          content: [
+            { type: 'text' as const, text: `後端查不到 id 為 ${resolved.id} 的採購單。` },
+          ],
+        };
+      }
+      if (!res.ok) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `查詢明細失敗:HTTP ${res.status} ${res.statusText}`,
+            },
+          ],
+        };
+      }
+
+      const detail = (await res.json()) as PurchaseOrderDetails;
+
+      // ── (C) 組成人看得懂的輸出。用一段一段拼,最後用空行隔開 ──
+      const sections: string[] = [];
+
+      // 表頭:只有「用單號查」時才有(明細 API 本身不含表頭欄位)
+      if (resolved.header) {
+        const h = resolved.header;
+        sections.push(
+          `採購單 ${h.po_number ?? '(無單號)'} — ${h.name ?? '(無名稱)'}\n` +
+            `狀態:${formatStatus(h.status)}｜金額:${h.total_cost ?? 'N/A'}｜` +
+            `預計交期:${h.expected_delivery_date ?? 'N/A'}`
+        );
+      } else {
+        sections.push(`採購單(後端 id ${resolved.id})的明細:`);
+      }
+
+      // ⚠️ 後端抓 FreshService 失敗時一定要明講。
+      //    否則下面的「品項:無」會被讀成「這張單沒有品項」,那是錯的。
+      if (detail.warning) {
+        sections.push(
+          `⚠️ 後端無法從 FreshService 取得此採購單的品項與基本資料` +
+            `(後端訊息:${detail.warning})。\n` +
+            `   所以下面的「採購品項」與「基本資料」可能是空的——` +
+            `這代表「取不到」,不代表「沒有」。`
+        );
+      }
+
+      // 採購品項
+      const items = detail.purchase_items ?? [];
+      if (items.length > 0) {
+        const lines = items.map((it, i) => {
+          const head =
+            `${i + 1}. ${it.item_name ?? '(無品名)'} × ${it.quantity ?? 'N/A'}` +
+            `｜單價:${it.unit_price ?? 'N/A'}｜小計:${it.total_cost ?? 'N/A'}`;
+          return it.description ? `${head}\n   說明:${it.description}` : head;
+        });
+        sections.push(`【採購品項】共 ${items.length} 項\n${lines.join('\n')}`);
+      } else if (!detail.warning) {
+        // 沒有 warning 才敢說「無」——有 warning 時上面已經解釋過了
+        sections.push('【採購品項】無');
+      }
+
+      // 基本資料:info 的每個欄位都可能是 null,只列出真的有值的
+      const info = detail.info ?? {};
+      const infoRows: string[] = [];
+      if (info.requestor_deliver_to) infoRows.push(`收件人/送達:${info.requestor_deliver_to}`);
+      if (info.payment_terms != null && info.payment_terms !== '')
+        infoRows.push(`付款條件:${info.payment_terms}`);
+      if (info.date_of_order) infoRows.push(`下單日期:${info.date_of_order}`);
+      if (info.shipping_address) infoRows.push(`送貨地址:${info.shipping_address}`);
+      if (infoRows.length > 0) {
+        sections.push(`【基本資料】\n${infoRows.map((r) => `  ${r}`).join('\n')}`);
+      }
+
+      // 發票(來自後端本地資料庫,不是 FreshService,所以不受 warning 影響)
+      const invoices = detail.invoices ?? [];
+      if (invoices.length > 0) {
+        const lines = invoices.map(
+          (inv, i) =>
+            `${i + 1}. ${inv.invoice_number ?? '(無發票號)'}` +
+            `｜金額:${inv.total ?? 'N/A'}｜狀態:${inv.status ?? 'N/A'}`
+        );
+        sections.push(`【發票】共 ${invoices.length} 張\n${lines.join('\n')}`);
+      } else {
+        sections.push('【發票】尚無登錄的發票');
+      }
+
+      // 附件:processed 代表這個檔案已經被解析成某張發票
+      const attachments = detail.attachments ?? [];
+      if (attachments.length > 0) {
+        const lines = attachments.map((a, i) => {
+          const state = a.processed
+            ? `已對應發票 ${a.invoice_number ?? '(未知號碼)'}`
+            : '尚未處理';
+          return `${i + 1}. ${a.filename}(${state})`;
+        });
+        sections.push(`【附件】共 ${attachments.length} 個\n${lines.join('\n')}`);
+      } else {
+        sections.push('【附件】無');
+      }
+
+      return { content: [{ type: 'text' as const, text: sections.join('\n\n') }] };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{ type: 'text' as const, text: `❌ 查詢採購單明細時發生錯誤:${message}` }],
+      };
+    }
+  }
+);
+
 // 採購單的型別(對應後端 search route 回傳的欄位)
 interface PurchaseOrder {
   id: number | string;
@@ -313,6 +523,43 @@ interface PurchaseOrder {
   status: number | null; // Freshservice 的數字狀態碼(見 PO_STATUS_LABELS)
   expected_delivery_date: string | null;
   created_at: string | null;
+}
+
+// 採購單明細的型別(對應後端 routes/purchaseOrderDetails.ts 的回傳)
+// 注意:這支 API「不含表頭欄位」(沒有 po_number / name / status / 金額),
+// 只給品項、基本資料、發票、附件。所以工具的表頭是拿搜尋結果補上的。
+interface PurchaseOrderDetails {
+  purchase_items: {
+    item_name: string | null;
+    description: string | null;
+    quantity: number | null;
+    unit_price: number | null;
+    total_cost: number | null;
+  }[];
+  info: {
+    requestor_deliver_to?: string | null;
+    payment_terms?: string | number | null;
+    date_of_order?: string | null;
+    shipping_address?: string | null;
+  };
+  invoices: {
+    id: number | string;
+    invoice_number: string | null;
+    total: number | null;
+    status: string | null;
+    source_filename: string | null;
+  }[];
+  attachments: {
+    filename: string;
+    path: string;
+    processed: boolean; // 這個檔案是否已被解析成某張發票
+    invoice_number: string | null;
+  }[];
+  // 後端向 FreshService 取資料失敗時才會出現這個欄位。
+  // ⚠️ 很重要:有 warning 的時候 purchase_items 和 info 會是空的,
+  //    但那是「抓取失敗」,不是「這張單沒有品項」。工具一定要照實轉達,
+  //    否則 AI 會把失敗講成「查無品項」,那是會誤導人的錯誤答案。
+  warning?: string;
 }
 
 // ── 啟動 ────────────────────────────────────────────────────
